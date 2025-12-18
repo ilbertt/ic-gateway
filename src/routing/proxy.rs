@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::{MatchedPath, OriginalUri, Path, Request, State},
@@ -27,18 +21,16 @@ use ic_bn_lib::{
             CONTENT_TYPE_CBOR, X_CONTENT_TYPE_OPTIONS_NO_SNIFF, X_FRAME_OPTIONS_DENY,
             strip_connection_headers,
         },
-        proxy::proxy,
         url_to_uri,
     },
     ic_agent::agent::route_provider::RouteProvider,
 };
-use ic_bn_lib_common::{
-    traits::http::{Client, ClientHttp},
-    types::http::Error as HttpError,
-};
+use ic_bn_lib_common::{traits::http::ClientHttp, types::http::Error as HttpError};
 use regex::Regex;
 use tokio::time::sleep;
 use url::Url;
+
+use crate::routing::error_cause::ClientError;
 
 use super::{
     error_cause::ErrorCause,
@@ -108,7 +100,8 @@ pub async fn api_proxy(
 ) -> Result<impl IntoResponse, ErrorCause> {
     // Check principal for correctness
     if let Some(v) = principal {
-        Principal::from_text(v.0).map_err(|_| ErrorCause::IncorrectPrincipal)?;
+        Principal::from_text(v.0)
+            .map_err(|_| ErrorCause::Client(ClientError::IncorrectPrincipal))?;
     }
 
     // Obtain a list of IC URLs from the provider
@@ -124,7 +117,7 @@ pub async fn api_proxy(
     // Buffer the request body to be able to retry it
     let body = Full::new(
         buffer_body(body, state.request_max_size, state.request_body_timeout)
-            .map_err(|e| ErrorCause::ClientBodyError(e.to_string()))
+            .map_err(|e| ErrorCause::Client(ClientError::Body(e.to_string())))
             .await?,
     );
 
@@ -147,10 +140,13 @@ pub async fn api_proxy(
                 .unwrap_or(&state.pq_default)
                 .as_str(),
         )
-        .map_err(|e| ErrorCause::MalformedRequest(format!("invalid URL: {e:#}")))?;
+        .map_err(|e| {
+            ErrorCause::Client(ClientError::MalformedRequest(format!("invalid URL: {e:#}")))
+        })?;
 
-        let uri = url_to_uri(&url)
-            .map_err(|e| ErrorCause::MalformedRequest(format!("invalid URL: {e:#}")))?;
+        let uri = url_to_uri(&url).map_err(|e| {
+            ErrorCause::Client(ClientError::MalformedRequest(format!("invalid URL: {e:#}")))
+        })?;
 
         let mut request = Request::from_parts(parts.clone(), body.clone());
         *request.uri_mut() = uri;
@@ -202,50 +198,10 @@ pub async fn api_proxy(
     Ok(response)
 }
 
-#[derive(new)]
-pub struct IssuerProxyState {
-    http_client: Arc<dyn Client>,
-    issuers: Vec<Url>,
-    #[new(default)]
-    next: AtomicUsize,
-}
-
-// Proxies /registrations endpoint to the certificate issuers if they're defined
-pub async fn issuer_proxy(
-    State(state): State<Arc<IssuerProxyState>>,
-    OriginalUri(original_uri): OriginalUri,
-    matched_path: MatchedPath,
-    id: Option<Path<String>>,
-    request: Request,
-) -> Result<impl IntoResponse, ErrorCause> {
-    // Validate request ID if it's provided
-    if let Some(v) = id
-        && !REGEX_REG_ID.is_match(&v.0)
-    {
-        return Err(ErrorCause::MalformedRequest(
-            "Incorrect request ID format".into(),
-        ));
-    }
-
-    // Pick next issuer using round-robin & generate request URL for it
-    // TODO should we do retries here?
-    let next = state.next.fetch_add(1, Ordering::SeqCst) % state.issuers.len();
-    let url = state.issuers[next]
-        .clone()
-        .join(original_uri.path())
-        .map_err(|_| ErrorCause::Other("Unable to parse path as URL part".into()))?;
-
-    let mut response = proxy(url, request, &state.http_client)
-        .await
-        .map_err(ErrorCause::from_backend_error)?;
-
-    response.extensions_mut().insert(matched_path);
-
-    Ok(response)
-}
-
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::{Router, body::Body};
     use http::{Method, Request, Response, Uri};
     use http_body_util::BodyExt;

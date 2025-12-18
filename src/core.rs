@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Context, Error, anyhow};
 use axum::Router;
-use custom_domains_backend::setup;
 use ic_bn_lib::{
     custom_domains::{self},
     http::{self as bnhttp, dns::ApiBnResolver, middleware::waf::WafLayer, redirect_to_https},
@@ -38,7 +37,7 @@ use crate::{
             route_provider::{RouteProviderWrapper, setup_route_provider},
         },
     },
-    tls::{self, setup_issuers},
+    tls::{self},
 };
 
 pub const SERVICE_NAME: &str = "ic_gateway";
@@ -191,6 +190,7 @@ pub async fn main(
             &mut tasks,
             &mut certificate_providers,
             &mut custom_domain_providers,
+            cli.rate_limit.rate_limit_bypass_token.clone(),
         )
         .await
         .context("unable to setup Custom Domains")?;
@@ -200,23 +200,6 @@ pub async fn main(
     } else {
         None
     };
-
-    // Setup Certificate Issuers
-    let issuers = setup_issuers(cli, &mut tasks, http_client.clone(), &registry);
-
-    custom_domain_providers.extend(
-        issuers
-            .clone()
-            .into_iter()
-            .map(|x| x as Arc<dyn ProvidesCustomDomains>),
-    );
-
-    certificate_providers.extend(
-        issuers
-            .clone()
-            .into_iter()
-            .map(|x| x as Arc<dyn ProvidesCertificates>),
-    );
 
     // Load generic custom domain providers
     custom_domain_providers.extend(cli.domain.domain_custom_provider.iter().map(|x| {
@@ -376,20 +359,22 @@ pub async fn main(
 }
 
 async fn setup_custom_domains(
-    cli: &custom_domains_base::cli::CustomDomainsCli,
+    cli: &ic_custom_domains_base::cli::CustomDomainsCli,
     dns_options: DnsOptions,
     metrics_registry: &Registry,
     tasks: &mut TaskManager,
     certificate_providers: &mut Vec<Arc<dyn ProvidesCertificates>>,
     custom_domain_providers: &mut Vec<Arc<dyn ProvidesCustomDomains>>,
+    rate_limiter_bypass_token: Option<String>,
 ) -> Result<Router, Error> {
     let token = tasks.token();
-    let (workers, router, client) = setup(
+    let (workers, router, client) = ic_custom_domains_backend::setup(
         cli,
         dns_options,
         token,
         HOSTNAME.get().unwrap(),
         metrics_registry.clone(),
+        rate_limiter_bypass_token,
     )
     .await?;
 

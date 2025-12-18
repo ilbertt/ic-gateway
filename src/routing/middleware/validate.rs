@@ -7,17 +7,19 @@ use axum::{
     response::IntoResponse,
 };
 use candid::Principal;
+use derive_new::new;
 use fqdn::FQDN;
 use http::header::REFERER;
 use ic_bn_lib::http::extract_authority;
 use url::{Url, form_urlencoded};
 
 use crate::routing::{
-    CanisterId, ErrorCause, RequestCtx, RequestType, domain::ResolvesDomain,
-    error_cause::ERROR_CONTEXT,
+    CanisterId, ErrorCause, RequestCtx, RequestType,
+    domain::ResolvesDomain,
+    error_cause::{CanisterError, ClientError, ERROR_CONTEXT},
 };
 
-#[derive(Clone)]
+#[derive(Clone, new)]
 pub struct ValidateState {
     pub resolver: Arc<dyn ResolvesDomain>,
     pub canister_id_from_query_params: bool,
@@ -31,25 +33,27 @@ pub async fn middleware(
 ) -> Result<impl IntoResponse, ErrorCause> {
     // Try to extract the authority
     let Some(authority) = extract_authority(&request).and_then(|x| FQDN::from_str(x).ok()) else {
-        return Err(ErrorCause::NoAuthority);
+        return Err(ErrorCause::Client(ClientError::NoAuthority));
     };
 
     // Inject authority into error context
     let _ = ERROR_CONTEXT.try_with(|x| {
-        let mut v = x.borrow_mut();
-        v.authority = Some(authority.clone());
+        let mut ctx = x.borrow_mut();
+        ctx.authority = Some(authority.clone());
     });
 
     // Resolve the domain
     let mut lookup = state
         .resolver
         .resolve(&authority)
-        .ok_or(ErrorCause::UnknownDomain(authority.clone()))?;
+        .ok_or(ErrorCause::Client(ClientError::UnknownDomain(
+            authority.clone(),
+        )))?;
 
     // If configured - try to resolve canister id from query params
     if state.canister_id_from_query_params && lookup.canister_id.is_none() {
         lookup.canister_id = canister_id_from_query_params(&request)
-            .map_err(|e| ErrorCause::CanisterIdIncorrect(e.to_string()))?
+            .map_err(|e| ErrorCause::Canister(CanisterError::IdIncorrect(e.to_string())))?
     }
 
     if state.canister_id_from_referer && lookup.canister_id.is_none() {
@@ -64,13 +68,22 @@ pub async fn middleware(
             });
     }
 
-    // Inject canister_id separately if it was resolved
+    // Inject the canister id separately if it was resolved
     if let Some(v) = lookup.canister_id {
+        // Inject the canister id into error context
+        let _ = ERROR_CONTEXT.try_with(|x| {
+            let mut ctx = x.borrow_mut();
+            ctx.canister_id = Some(v);
+        });
+
         request.extensions_mut().insert(CanisterId(v));
     }
 
-    // Always provided by the preceding middleware so should be safe
-    let request_type = request.extensions().get::<RequestType>().copied().unwrap();
+    let request_type = request
+        .extensions()
+        .get::<RequestType>()
+        .copied()
+        .unwrap_or_default();
 
     // Inject request context
     let ctx = Arc::new(RequestCtx {

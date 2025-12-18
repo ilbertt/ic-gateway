@@ -6,9 +6,10 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use ic_bn_lib::http::middleware::extract_ip_from_request;
 use maxminddb::geoip2;
 use tracing::warn;
+
+use crate::routing::RemoteAddr;
 
 #[derive(Clone, Debug)]
 pub struct CountryCode(pub String);
@@ -21,11 +22,13 @@ impl GeoIp {
     pub fn new(db_path: &PathBuf) -> Result<Self, Error> {
         let start = Instant::now();
         let db = maxminddb::Reader::open_readfile(db_path)?;
+
         warn!(
             "GeoIP loaded with {} entries in {}s",
             db.metadata.node_count,
             start.elapsed().as_secs_f64()
         );
+
         Ok(Self { db })
     }
 
@@ -44,17 +47,19 @@ pub async fn middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let ip = extract_ip_from_request(&request);
+    let remote_addr = request.extensions().get::<RemoteAddr>().copied();
 
     // Lookup code
-    let country_code = ip.map(|x| geoip.lookup(x));
+    let country_code = remote_addr.and_then(|x| geoip.lookup(*x));
 
     if let Some(v) = &country_code {
         request.extensions_mut().insert(v.clone());
     }
 
+    #[allow(unused_mut)]
     let mut response = next.run(request).await;
 
+    #[cfg(test)]
     if let Some(v) = country_code {
         response.extensions_mut().insert(v);
     }

@@ -4,12 +4,12 @@ pub mod ic;
 pub mod middleware;
 pub mod proxy;
 
-use std::{ops::Deref, str::FromStr, sync::Arc, time::Duration};
+use std::{net::IpAddr, ops::Deref, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Error};
 use axum::{
     Extension, Router,
-    extract::{MatchedPath, Request},
+    extract::Request,
     middleware::{FromFnLayer, from_fn, from_fn_with_state},
     response::{IntoResponse, Redirect},
     routing::{get, post},
@@ -18,26 +18,37 @@ use axum_extra::{either::Either, extract::Host, middleware::option_layer};
 use bytes::Bytes;
 use candid::Principal;
 use fqdn::FQDN;
-use http::{StatusCode, method::Method};
+use http::{HeaderValue, StatusCode, method::Method};
 use http_body_util::Full;
 use ic_bn_lib::{
     http::{
         cache::{CacheBuilder, KeyExtractorUriRange},
         extract_host,
-        middleware::{waf::WafLayer, rate_limiter},
+        middleware::waf::WafLayer,
         shed::{
-            sharded::{ShardedLittleLoadShedderLayer},
+            sharded::ShardedLittleLoadShedderLayer,
             system::{SystemInfo, SystemLoadShedderLayer},
         },
     },
+    hval,
     ic_agent::agent::route_provider::RouteProvider,
     tasks::TaskManager,
     utils::health_manager::HealthManager,
     vector::client::Vector,
 };
-use ic_bn_lib_common::{traits::{custom_domains::ProvidesCustomDomains, http::{Client, ClientHttp}, shed::TypeExtractor}, types::{RequestType as RequestTypeApi, shed::{ShardedOptions, ShedResponse}}};
+use ic_bn_lib_common::{
+    traits::{
+        custom_domains::ProvidesCustomDomains,
+        http::{Client, ClientHttp},
+        shed::TypeExtractor,
+    },
+    types::{
+        RequestType as RequestTypeApi,
+        shed::{ShardedOptions, ShedResponse},
+    },
+};
 use prometheus::Registry;
-use strum::{Display, IntoStaticStr};
+use strum::Display;
 use tokio_util::sync::CancellationToken;
 use tower::{ServiceBuilder, ServiceExt, limit::ConcurrencyLimitLayer, util::MapResponseLayer};
 use tracing::warn;
@@ -48,16 +59,13 @@ use crate::{
     api::setup_api_router,
     cli::Cli,
     metrics::{self},
-    routing::{
-        error_cause::RateLimitCause,
-        middleware::{canister_match, cors, geoip, headers, request_id, request_type, validate},
-    },
+    routing::middleware::{canister_match, cors, geoip, headers, preprocess, request_id, validate},
 };
 use domain::{CustomDomainStorage, DomainResolver};
 use middleware::{
     cache,
     cors::{ALLOW_HEADERS, ALLOW_HEADERS_HTTP, ALLOW_METHODS_HTTP},
-    request_type::RequestTypeState,
+    preprocess::PreprocessState,
     validate::ValidateState,
 };
 
@@ -71,6 +79,8 @@ use {
     error_cause::ErrorCause,
     ic::handler,
 };
+
+pub const CONTENT_TYPE_JSON: HeaderValue = hval!("application/json");
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct CanisterId(pub Principal);
@@ -89,21 +99,21 @@ impl Deref for CanisterId {
     }
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, Display, PartialEq, Eq, PartialOrd, Ord, Hash, IntoStaticStr,
-)]
+#[derive(Debug, Default, Clone, Copy, Display, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[strum(serialize_all = "snake_case")]
 pub enum RequestType {
     Http,
     Health,
     Registrations,
-    #[strum(to_string = "{0}")]
+    CustomDomains,
+    #[strum(transparent)]
     Api(RequestTypeApi),
     #[default]
     Unknown,
 }
 
-// Strum can't handle FromStr for nested types (Api) the way we want
+// Strum can't handle FromStr for nested types (Api) the way we want.
+// See https://github.com/Peternator7/strum/pull/331
 impl FromStr for RequestType {
     type Err = ic_bn_lib_common::Error;
 
@@ -112,6 +122,7 @@ impl FromStr for RequestType {
             "http" => Self::Http,
             "health" => Self::Health,
             "registrations" => Self::Registrations,
+            "custom_domains" => Self::CustomDomains,
             "unknown" => Self::Unknown,
             _ => Self::Api(RequestTypeApi::from_str(s).context("unable to parse API type")?),
         })
@@ -119,13 +130,17 @@ impl FromStr for RequestType {
 }
 
 // Derive request type from the matched path if there's one
-impl From<Option<&MatchedPath>> for RequestType {
-    fn from(path: Option<&MatchedPath>) -> Self {
+impl From<Option<&str>> for RequestType {
+    fn from(path: Option<&str>) -> Self {
         let Some(path) = path else {
             return Self::Http;
         };
 
-        match path.as_str() {
+        if path.starts_with("/custom-domains/v1/") {
+            return Self::CustomDomains;
+        }
+
+        match path {
             "/api/v2/canister/{principal}/query" => Self::Api(RequestTypeApi::QueryV2),
             "/api/v3/canister/{principal}/query" => Self::Api(RequestTypeApi::QueryV3),
             "/api/v2/canister/{principal}/call" => Self::Api(RequestTypeApi::CallV2),
@@ -171,6 +186,18 @@ impl TypeExtractor for RequestTypeExtractor {
     }
 }
 
+/// Client address
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteAddr(pub IpAddr);
+
+impl Deref for RemoteAddr {
+    type Target = IpAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 // TODO: make it less horrible by using maybe builder pattern or just a struct
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
@@ -200,7 +227,8 @@ pub async fn setup_router(
     )
     .context("unable to setup API Router")?;
 
-    let custom_domain_storage = Arc::new(CustomDomainStorage::new(custom_domain_providers));
+    let custom_domain_storage =
+        Arc::new(CustomDomainStorage::new(custom_domain_providers, registry));
     tasks.add_interval(
         "custom_domain_storage",
         custom_domain_storage.clone(),
@@ -367,7 +395,7 @@ pub async fn setup_router(
     let cors_post = cors_base.clone().allow_methods([Method::POST]);
     let cors_get = cors_base.clone().allow_methods([Method::HEAD, Method::GET]);
 
-    let api_proxy_handler = post(proxy::api_proxy).layer(cors_post.clone());
+    let api_proxy_handler = post(proxy::api_proxy).layer(cors_post);
 
     // IC API proxy routers
     let router_api_v2 = Router::new()
@@ -463,54 +491,17 @@ pub async fn setup_router(
             .with_state(state_handler),
     );
 
-    // Setup certificate issuer proxy endpoint if we have them configured
-    let router_issuer = if !cli.cert.cert_provider_issuer_url.is_empty() {
-        // Init it early to avoid threading races
-        lazy_static::initialize(&proxy::REGEX_REG_ID);
-
-        let state = Arc::new(proxy::IssuerProxyState::new(
-            http_client,
-            cli.cert.cert_provider_issuer_url.clone(),
-        ));
-
-        let router = Router::new()
-            .route(
-                "/registrations/{id}",
-                get(proxy::issuer_proxy)
-                    .put(proxy::issuer_proxy)
-                    .delete(proxy::issuer_proxy)
-                    .layer(cors_base.allow_methods([
-                        Method::HEAD,
-                        Method::GET,
-                        Method::PUT,
-                        Method::DELETE,
-                    ])),
-            )
-            .route("/registrations", post(proxy::issuer_proxy).layer(cors_post))
-            .layer(rate_limiter::layer_by_ip(
-                1,
-                2,
-                RateLimitCause::Normal,
-                cli.rate_limit.rate_limit_bypass_token.clone(),
-            )?)
-            .with_state(state);
-
-        Some(router)
-    } else {
-        warn!("Running without certificate issuer.");
-        None
-    };
-
-    let validate_state = ValidateState {
-        resolver: domain_resolver,
-        canister_id_from_query_params: cli.domain.domain_canister_id_from_query_params,
-        canister_id_from_referer: cli.domain.domain_canister_id_from_referer,
-    };
+    let validate_state = ValidateState::new(
+        domain_resolver,
+        cli.domain.domain_canister_id_from_query_params,
+        cli.domain.domain_canister_id_from_referer,
+    );
 
     // Request type state for alternate error domain configuration
-    let request_type_state = Arc::new(RequestTypeState {
-        alternate_error_domain: cli.misc.alternate_error_domain.clone(),
-    });
+    let request_type_state = Arc::new(PreprocessState::new(
+        cli.misc.alternate_error_domain.clone(),
+        cli.misc.disable_html_error_messages,
+    ));
 
     // Common layers for all routes
     let common_layers = ServiceBuilder::new()
@@ -521,20 +512,29 @@ pub async fn setup_router(
         .layer(from_fn(headers::middleware))
         .layer(from_fn_with_state(
             request_type_state,
-            request_type::middleware,
+            preprocess::middleware,
         ))
+        .layer(geoip_mw)
         .layer(metrics_mw)
         .layer(option_layer(waf_layer))
         .layer(load_shedder_system_mw)
         .layer(from_fn_with_state(validate_state, validate::middleware))
         .layer(concurrency_limit_mw)
-        .layer(geoip_mw)
         .layer(load_shedder_latency_mw);
 
     let api_hostname = cli.api.api_hostname.clone().map(|x| x.to_string());
 
-    let custom_domains_router =
-        custom_domains_router.map(|x| Router::new().nest("/custom-domains", x));
+    let custom_domains_router = custom_domains_router.map(|x| {
+        Router::new()
+            .nest("/custom-domains", x)
+            .layer(cors_base.allow_methods([
+                Method::HEAD,
+                Method::GET,
+                Method::POST,
+                Method::DELETE,
+                Method::PATCH,
+            ]))
+    });
 
     // Top-level router
     #[allow(unused_mut)]
@@ -553,24 +553,8 @@ pub async fn setup_router(
                 let canister_id = request.extensions().get::<CanisterId>();
 
                 // If the custom domains are enabled and the request came to the base domain
-                if let Some(v) = custom_domains_router 
-                    && ctx.is_base_domain()
-                    && path.starts_with("/custom-domains")
-                {
+                if let Some(v) = custom_domains_router && ctx.is_base_domain() && path.starts_with("/custom-domains") {
                     return v.oneshot(request).await;
-                }
-
-                // If there are issuers defined and the request came to the base domain -> proxy to them
-                if let Some(v) = router_issuer
-                    && ctx.is_base_domain()
-                    && path.starts_with("/registrations")
-                {
-                    return v.oneshot(request).await;
-                }
-
-                // TODO remove when CF healthchecks are switched to API domains
-                if path.starts_with("/health") && ctx.is_base_domain() {
-                    return router_api.oneshot(request).await;
                 }
 
                 // Redirect to the dashboard if the request is to the root of the base domain
@@ -604,10 +588,10 @@ pub async fn setup_router(
                     )
                     .context("unable to init SEV-SNP")?,
                 )
-                .layer(rate_limiter::layer_global(
+                .layer(ic_bn_lib::http::middleware::rate_limiter::layer_global(
                     50,
                     100,
-                    RateLimitCause::Normal,
+                    crate::routing::error_cause::RateLimitCause::Normal,
                     cli.rate_limit.rate_limit_bypass_token.clone(),
                 )?),
         );
@@ -620,15 +604,20 @@ pub async fn setup_router(
 
 #[cfg(test)]
 mod test {
-    use crate::test::setup_test_router;
+    use crate::{
+        routing::middleware::{geoip::CountryCode, request_id::RequestId},
+        test::setup_test_router,
+    };
 
     use super::*;
     use axum::body::{Body, to_bytes};
-    use http::Uri;
+    use http::{HeaderValue, Uri};
+    use ic_bn_lib::http::headers::{X_REAL_IP, X_REQUEST_ID};
     use ic_bn_lib_common::types::http::ConnInfo;
     use rand::{seq::SliceRandom, thread_rng};
     use std::str::FromStr;
     use tower::Service;
+    use uuid::Uuid;
 
     #[test]
     fn test_request_type() {
@@ -672,6 +661,63 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_request_type_derive() {
+        let cases = [
+            (
+                "/api/v2/canister/{principal}/query",
+                RequestType::Api(RequestTypeApi::QueryV2),
+            ),
+            (
+                "/api/v3/canister/{principal}/query",
+                RequestType::Api(RequestTypeApi::QueryV3),
+            ),
+            (
+                "/api/v2/canister/{principal}/call",
+                RequestType::Api(RequestTypeApi::CallV2),
+            ),
+            (
+                "/api/v3/canister/{principal}/call",
+                RequestType::Api(RequestTypeApi::CallV3),
+            ),
+            (
+                "/api/v4/canister/{principal}/call",
+                RequestType::Api(RequestTypeApi::CallV4),
+            ),
+            (
+                "/api/v2/canister/{principal}/read_state",
+                RequestType::Api(RequestTypeApi::ReadStateV2),
+            ),
+            (
+                "/api/v3/canister/{principal}/read_state",
+                RequestType::Api(RequestTypeApi::ReadStateV3),
+            ),
+            (
+                "/api/v2/subnet/{principal}/read_state",
+                RequestType::Api(RequestTypeApi::ReadStateSubnetV2),
+            ),
+            (
+                "/api/v3/subnet/{principal}/read_state",
+                RequestType::Api(RequestTypeApi::ReadStateSubnetV3),
+            ),
+            ("/api/v2/status", RequestType::Api(RequestTypeApi::Status)),
+            ("/health", RequestType::Health),
+            ("/registrations", RequestType::Registrations),
+            ("/custom-domains/v1/foo.bar", RequestType::CustomDomains),
+            (
+                "/custom-domains/v1/foo.bar/validate",
+                RequestType::CustomDomains,
+            ),
+            ("", RequestType::Unknown),
+        ];
+
+        for (path, rt) in cases {
+            assert_eq!(RequestType::from(Some(path)), rt);
+        }
+
+        assert_eq!(RequestType::from(None), RequestType::Http);
+    }
+
     #[tokio::test]
     async fn test_setup_router() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -690,11 +736,30 @@ mod test {
         let mut req = axum::extract::Request::new(Body::from(""));
         *req.uri_mut() = Uri::try_from(format!("http://{domain}")).unwrap();
         let conn_info = Arc::new(ConnInfo::default());
-        (*req.extensions_mut()).insert(conn_info);
+        req.extensions_mut().insert(conn_info);
+        // Some Swiss IP
+        let remote_addr = IpAddr::from_str("77.109.180.4").unwrap();
+        req.headers_mut().insert(
+            X_REAL_IP,
+            HeaderValue::from_str(&remote_addr.to_string()).unwrap(),
+        );
+
+        // Send request id
+        let request_id = Uuid::from_str("7373F02E-9560-4E16-AC6D-4974300C827B").unwrap();
+        req.headers_mut().insert(
+            X_REQUEST_ID,
+            HeaderValue::from_str(&request_id.to_string()).unwrap(),
+        );
 
         // Make sure that we get right answer
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.extensions().get::<RemoteAddr>().unwrap().0,
+            remote_addr,
+        );
+        assert_eq!(resp.extensions().get::<CountryCode>().unwrap().0, "CH");
+        assert_eq!(resp.extensions().get::<RequestId>().unwrap().0, request_id);
 
         let body = resp.into_body();
         let body = to_bytes(body, 1024).await.unwrap();

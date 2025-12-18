@@ -55,7 +55,7 @@ pub struct Cli {
     pub domain: Domain,
 
     #[command(flatten, next_help_heading = "Custom Domains")]
-    pub custom_domains: Option<custom_domains_base::cli::CustomDomainsCli>,
+    pub custom_domains: Option<ic_custom_domains_base::cli::CustomDomainsCli>,
 
     #[command(flatten, next_help_heading = "Policy")]
     pub policy: Policy,
@@ -205,15 +205,6 @@ pub struct Cert {
     /// Each certificate should be a pair .pem + .key files with the same base name.
     #[clap(env, long, value_delimiter = ',')]
     pub cert_provider_dir: Vec<PathBuf>,
-
-    /// Request certificates from the 'certificate-issuer' instances reachable over given URLs.
-    /// Also proxies the `/registrations` path to those issuers.
-    #[clap(env, long, value_delimiter = ',')]
-    pub cert_provider_issuer_url: Vec<Url>,
-
-    /// How frequently to refresh certificate issuers
-    #[clap(env, long, default_value = "30s", value_parser = parse_duration)]
-    pub cert_provider_issuer_poll_interval: Duration,
 
     /// How frequently to poll providers for certificates
     #[clap(env, long, default_value = "5s", value_parser = parse_duration)]
@@ -498,6 +489,11 @@ pub struct Misc {
     /// If enabled - requires all providers to report healthy status for `ic-gateway` to be healthy.
     #[clap(env, long)]
     pub custom_domain_provider_critical: bool,
+
+    /// Disable generation of nice user-friendly HTML error messages.
+    /// Instead it produces more detailed JSON-encoded errors.
+    #[clap(env, long)]
+    pub disable_html_error_messages: bool,
 }
 
 #[derive(Args)]
