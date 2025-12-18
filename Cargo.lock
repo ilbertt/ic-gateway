@@ -2577,55 +2577,6 @@ dependencies = [
 
 [[package]]
 name = "ic-agent"
-version = "0.42.0"
-source = "git+https://github.com/dfinity/agent-rs?rev=f34acedb5539838ffdbd4cf49a0832303977293f#f34acedb5539838ffdbd4cf49a0832303977293f"
-dependencies = [
- "arc-swap",
- "async-channel 1.9.0",
- "async-lock",
- "async-trait",
- "async-watch",
- "backoff",
- "bytes",
- "cached 0.52.0",
- "candid",
- "der",
- "ecdsa",
- "ed25519-consensus",
- "elliptic-curve",
- "futures-util",
- "hex",
- "http 1.4.0",
- "http-body",
- "http-body-util",
- "ic-certification 3.0.3",
- "ic-ed25519",
- "ic-transport-types 0.42.0",
- "ic-verify-bls-signature",
- "k256",
- "leb128",
- "p256",
- "pem 3.0.6",
- "pkcs8",
- "rand 0.8.5",
- "rangemap",
- "reqwest",
- "sec1",
- "serde",
- "serde_bytes",
- "serde_cbor",
- "serde_repr",
- "sha2 0.10.9",
- "stop-token",
- "thiserror 2.0.17",
- "time",
- "tokio",
- "tower-service",
- "url",
-]
-
-[[package]]
-name = "ic-agent"
 version = "0.44.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5337598ec943bab711e0288319761abb5a7a7087ac226b03472441a90f88e0c"
@@ -2710,7 +2661,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "ic-agent 0.44.3",
+ "ic-agent",
  "ic-bn-lib-common",
  "indoc",
  "instant-acme",
@@ -2782,7 +2733,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
- "ic-agent 0.44.3",
+ "ic-agent",
  "instant-acme",
  "parse-size",
  "prometheus",
@@ -3163,8 +3114,8 @@ dependencies = [
 
 [[package]]
 name = "ic-http-gateway"
-version = "0.3.0"
-source = "git+https://github.com/ilbertt/http-gateway?branch=main#e35d66ecd805151d9c35b1d6176d53ac6ed13162"
+version = "0.0.0-git"
+source = "git+https://github.com/ilbertt/http-gateway?branch=main#a4c51a335a7c9f2ef3fba6179ad76648f7933ea5"
 dependencies = [
  "base64 0.22.1",
  "bhttp",
@@ -3174,7 +3125,7 @@ dependencies = [
  "http 1.4.0",
  "http-body",
  "http-body-util",
- "ic-agent 0.42.0",
+ "ic-agent",
  "ic-http-certification 3.0.3",
  "ic-response-verification 3.0.3",
  "ic-utils",
@@ -3187,6 +3138,17 @@ dependencies = [
 name = "ic-management-canister-types"
 version = "0.3.2"
 source = "git+https://github.com/dfinity/cdk-rs?rev=19fdcd4c928b71d010aa124e2bb7f874290edac9#19fdcd4c928b71d010aa124e2bb7f874290edac9"
+dependencies = [
+ "candid",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
+name = "ic-management-canister-types"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b5a939a84adbc30769d47e5de72c7b9f3713284e3ac87df4eb24795677a8df8"
 dependencies = [
  "candid",
  "serde",
@@ -3281,23 +3243,6 @@ dependencies = [
 
 [[package]]
 name = "ic-transport-types"
-version = "0.42.0"
-source = "git+https://github.com/dfinity/agent-rs?rev=f34acedb5539838ffdbd4cf49a0832303977293f#f34acedb5539838ffdbd4cf49a0832303977293f"
-dependencies = [
- "candid",
- "hex",
- "ic-certification 3.0.3",
- "leb128",
- "serde",
- "serde_bytes",
- "serde_cbor",
- "serde_repr",
- "sha2 0.10.9",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "ic-transport-types"
 version = "0.44.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5fec6355d0a542bfe484eb36343b6570047394124918cb8b435e22241c65427"
@@ -3316,14 +3261,15 @@ dependencies = [
 
 [[package]]
 name = "ic-utils"
-version = "0.42.0"
-source = "git+https://github.com/dfinity/agent-rs?rev=f34acedb5539838ffdbd4cf49a0832303977293f#f34acedb5539838ffdbd4cf49a0832303977293f"
+version = "0.44.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc35f1cf9c5053b108b24fbf24eed544dc37647a95b183e2e1c7dfb93da23d32"
 dependencies = [
  "async-trait",
  "candid",
  "futures-util",
- "ic-agent 0.42.0",
- "ic-management-canister-types",
+ "ic-agent",
+ "ic-management-canister-types 0.4.1",
  "once_cell",
  "semver",
  "serde",
@@ -3333,7 +3279,6 @@ dependencies = [
  "strum_macros 0.26.4",
  "thiserror 2.0.17",
  "time",
- "tokio",
 ]
 
 [[package]]
@@ -4521,7 +4466,7 @@ dependencies = [
  "flate2",
  "hex",
  "ic-certification 3.0.3",
- "ic-management-canister-types",
+ "ic-management-canister-types 0.3.2",
  "ic-transport-types 0.39.3",
  "reqwest",
  "schemars 0.8.22",
